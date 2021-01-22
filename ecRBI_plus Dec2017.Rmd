@@ -1,0 +1,217 @@
+---
+title: "ecRBI+"
+author: "Sam Messer"
+date: "5 December 2017"
+output: 
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+```{r, setup, include=FALSE}
+require(mosaic)   # Load additional packages here 
+library(dplyr)
+library(ggplot2)
+options(warn = -1)
+
+# Some customization.  You can alter or delete as desired (if you know what you are doing).
+trellis.par.set(theme=theme.mosaic()) # change default color scheme for lattice
+knitr::opts_chunk$set(
+  tidy=FALSE,     # display code as typed
+  size="small")   # slightly smaller font for code
+```
+
+###**Background**
+
+All data are pulled from retrosheet using a function written by Max Marchi and Jim Alpert in their book "Analyzing Baseball Data Using R."
+
+The stat was caluclated and implemented in R by Sam Messer. The idea for the stat was developed by Sam Messer, with help from Phil Zeffiro and Andy Wiesner. 
+
+###**The Stat**
+
+This new stat will be called *ecRBI+*, an index of expected contact RBI.
+
+```{r, echo = FALSE}
+retrosheet.clean <- function(chadwick_table) {
+  Clean_events <- chadwick_table %>% 
+    select(V5, V11, V27, V28, V29, V30, V44) %>% 
+    #For this stat, we only care about the on base situation (outs and runner 
+    #locations) and what actually happened
+    rename(outs = "V5", batter = "V11", b1 = "V27", b2 = "V28", b3 = "V29", event = "V30", rbi_play = "V44") %>% 
+    #We don't care who is on base, just that there is someone there, so we 
+    #replace batter ID with a simple base flag
+    mutate(b1 = ifelse(b1=="", 0, 1), 
+           b2 = ifelse(b2=="", 0, 1),
+           b3 = ifelse(b3=="", 0, 1),
+           #Define on base situation: each combination of (1,2,3) on base and 
+           #(0,1,2) outs is a different situation
+           situation = case_when(
+             b1==0 & b2==0 & b3==0 & outs==0 ~ 1, 
+             b1==0 & b2==0 & b3==0 & outs==1 ~ 2,
+             b1==0 & b2==0 & b3==0 & outs==2 ~ 3,
+             b1==1 & b2==0 & b3==0 & outs==0 ~ 4,
+             b1==1 & b2==0 & b3==0 & outs==1 ~ 5,
+             b1==1 & b2==0 & b3==0 & outs==2 ~ 6,
+             b1==0 & b2==1 & b3==0 & outs==0 ~ 7,
+             b1==0 & b2==1 & b3==0 & outs==1 ~ 8,
+             b1==0 & b2==1 & b3==0 & outs==2 ~ 9,
+             b1==1 & b2==1 & b3==0 & outs==0 ~ 10,
+             b1==1 & b2==1 & b3==0 & outs==1 ~ 11,
+             b1==1 & b2==1 & b3==0 & outs==2 ~ 12,
+             b1==0 & b2==0 & b3==1 & outs==0 ~ 13,
+             b1==0 & b2==0 & b3==1 & outs==1 ~ 14,
+             b1==0 & b2==0 & b3==1 & outs==2 ~ 15,
+             b1==1 & b2==0 & b3==1 & outs==0 ~ 16,
+             b1==1 & b2==0 & b3==1 & outs==1 ~ 17,
+             b1==1 & b2==0 & b3==1 & outs==2 ~ 18,
+             b1==0 & b2==1 & b3==1 & outs==0 ~ 19,
+             b1==0 & b2==1 & b3==1 & outs==1 ~ 20,
+             b1==0 & b2==1 & b3==1 & outs==2 ~ 21,
+             b1==1 & b2==1 & b3==1 & outs==0 ~ 22,
+             b1==1 & b2==1 & b3==1 & outs==1 ~ 23,
+             b1==1 & b2==1 & b3==1 & outs==2 ~ 24),
+           #A contact RBI is one where the hitter drives in a runner other than himself. If 
+           #there is a homer on the play, 1 RBI is subtracted from the cRBI.
+           cRBI = ifelse(grepl("HR", event), rbi_play - 1, rbi_play),
+           #We want to remove all intentional walks except when the bases are loaded because
+           #an intentional walk gives the batter no chance to hit the ball, and we don't 
+           #want to penalize those who get intentional walks a lot.
+           ibb_flag = ifelse(grepl("IW", event), 1, 0)) %>% 
+    filter(ibb_flag == 0 | (ibb_flag == 1 & situation >= 22)) %>% 
+    select(batter, situation, cRBI)
+  return(Clean_events)
+}
+```
+
+```{r , echo = FALSE}
+Events_2017 <- read.csv("all2017.csv",header=FALSE)
+
+Clean_2017 <- retrosheet.clean(Events_2017)
+
+Run_matrix <- Clean_2017 %>% 
+  #This filter is here to catch any situations where there is an event that doesn't end the plate appearance
+  #This includes: stolen bases, picked off runners, etc.
+  filter(batter != lead(batter)) %>% 
+  group_by(situation) %>% 
+  summarise(n_situation=n(), total=sum(cRBI)) %>% 
+  mutate(ecRBI = (total / n_situation))
+```
+
+```{r, echo = FALSE}
+#Player_RBI takes the cleaned data from this season and joins it with the run 
+#expectancy matrix and adds it up to get Season long numbers for all batters. 
+#I'm also keeping track of PA here so I can filter it later
+Player_RBI <- Clean_2017 %>% 
+  left_join(Run_matrix, by="situation") %>% 
+  select(batter, cRBI, ecRBI) %>% 
+  group_by(batter) %>% 
+  summarise(pa = n(), total_cRBI = sum(cRBI), total_ecRBI = sum(ecRBI))
+
+#The next two data tables serve to add more useful information. 
+#Batter ID's are replaced by batter names, and we get the position for position by position comparison
+Players_2017 <- read.csv("roster2017.csv")
+ 
+Players_with_numbers <- Player_RBI %>% 
+  left_join(Players_2017, by=c("batter"="Player.ID")) %>% 
+  select(batter, total_cRBI, total_ecRBI, pa, Last.Name, First.Name, V7, Team) %>% 
+  rename(position = "V7") %>% 
+  #Filter out batters with fewer than 100 PA. This is an arbitrary number, but it removes a lot of irrelevant data
+  filter(pa >= 100)
+
+#Some players were traded in the middle of the season, and thus have two entries in the roster csv. Here, I'm
+#just removing those duplicates   
+Unique_players <- unique(Players_with_numbers[,])
+
+#Finally, I create the index here and keep the variables that will be of interest for the visualization
+Final <- Unique_players %>% 
+  mutate(ecRBI_plus = 100 + (((total_cRBI - total_ecRBI)/total_ecRBI)*100), 
+         name = paste(First.Name, "\n", Last.Name)) %>% 
+  select(name, ecRBI_plus, pa, total_ecRBI, total_cRBI, position, Team) %>% 
+  arrange(desc(ecRBI_plus))
+```
+
+* The index (as designated by the + at the end) scales the batter's performance to nice numbers that are easy for us to  interpret. A value of 100 means that the batter is performing at the league average. Greater than 100 means that the batter is performing above league average, and less than 100 means that the batter is performing below league average. The plot below shows all of the batters who recorded at least 100 plate appearances in 2017, along with a line indicating league average. If the batter falls above the line, he is performing better than average, if he falls below, the opposite is true. Above and below the line are colored for clarity.
+
+```{r, echo = FALSE}
+Final %>% 
+  mutate(good_flag = ifelse(ecRBI_plus >= 100, 1, 0)) %>% 
+  ggplot(aes(x=total_ecRBI, y=total_cRBI, color = good_flag)) + 
+    geom_point() + geom_abline(slope = 1, intercept = 0) +
+    labs(x="Expected Contact RBI", 
+         y="Actual Contact RBI", 
+         title = "Actual versus Expected Contact RBI, 2017 Season") +
+  xlim(0, 100) + ylim(0, 100) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+```
+
+* The "contact" part of ecRBI refers to a new term, "contact RBI." A contact RBI occurs when a batter gets an RBI, but the run was not scored by the batter. The only situation where an RBI is not a contact RBI is when the batter hits a home run. For example, Nolan Arenado finished the 2017 season with 130 RBI, 93 of which were contact. He hit 37 home runs.
+
+* Finally, the "expected" part refers to the expected number of contact RBI a player will have. This expectation is found by taking a long term average of the contact RBI based on the on base situation (i.e. number of outs, location of runners on base.) This average can be calculated over one or more seasons, as far back as we have data. For our purposes, we have only used the 2017 season to calculate the expectation.
+
+```{r, echo = FALSE}
+Run_matrix %>% 
+  ggplot(aes(x = situation, y=ecRBI)) + 
+  geom_bar(stat = "identity", position = "stack", width = 0.9)+
+  xlim(0, 25) + ylim(0,1) +
+  labs(x = "Situation", y = "ecRBI", title = "Expected Contact RBI by Situation") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+###**Visualizations**
+
+I'd like to look at the top 10 batters as judged by this stat in 2017.
+
+```{r, echo = FALSE}
+Final %>% 
+  head(10) %>% 
+  ggplot(aes(x=reorder(name, -ecRBI_plus), y=ecRBI_plus)) + 
+  geom_bar(stat = 'identity', position = 'stack', width = 0.9) +
+  labs(x = "Batter", y = "ecRBI+", title = "Top 10 MLB Batters, by ecRBI+") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Something else I'd like to look at is comparisons across teams. The Boston Red Sox finished 93-69 in 2017,1st in their division. The Houston Astros finished 101-61, and ultimately went on to win the World Series. 
+
+Let's look at how the Red Sox stack up to the Astros.
+
+```{r, echo = FALSE}
+Final %>% 
+  filter(Team == "BOS" | Team == "HOU") %>% 
+  ggplot(aes(x=total_ecRBI, y=total_cRBI, color = Team)) + 
+    geom_point() + geom_abline(slope = 1, intercept = 0) +
+    labs(x="Expected Contact RBI", 
+         y="Actual Contact RBI", 
+         title = "Actual versus Expected Contact RBI, BOS vs. HOU") +
+  xlim(0, 100) + ylim(0, 100) +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5))
+```
+
+And one final visualization. Here I'm going to facet the batters by position and see how the positions stack up against each other.
+
+```{r, echo = FALSE}
+Final %>%
+  filter(position != "C " & position != "LF") %>% 
+  mutate(good_flag = ifelse(ecRBI_plus >= 100, 1, 0)) %>% 
+  ggplot(aes(x=total_ecRBI, y=total_cRBI, color = good_flag)) + 
+    geom_point() + geom_abline(slope = 1, intercept = 0) +
+    facet_wrap(~position) +
+    labs(x="Expected Contact RBI", 
+         y="Actual Contact RBI", 
+         title = "Actual versus Expected Contact RBI, 2017 Season") +
+    xlim(0, 100) + ylim(0, 100) +
+    theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+```
+
+###**Conclusions**
+
+Without further testing, not much can really be said in terms of the predictive power of ecRBI+. It does line up good hitters well at the top end of the spectrum, but it remains to be seen whether that alignment is useful. Regardless of the feasibility of ecRBI+ as a stat, this analysis has made it very simple to create a new stat, and tweaking it should be very simple. 
+
+```{r, include = FALSE, echo = FALSE}
+options(warn = 0)
+```
